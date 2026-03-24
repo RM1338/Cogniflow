@@ -1,0 +1,21 @@
+# Media files
+*.mp4
+*.webm
+*.part
+*.mp3
+*.wav
+*.flac
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
