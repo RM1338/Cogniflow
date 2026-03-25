@@ -6,6 +6,9 @@
 *.wav
 *.flac
 
+# Folders
+audios/
+
 # Python
 __pycache__/
 *.pyc
