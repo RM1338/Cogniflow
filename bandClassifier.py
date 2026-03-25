@@ -42,16 +42,23 @@ class EEGBoard:
         params       = BrainFlowInputParams()
         self._board  = BoardShim(config.MUSE_BOARD_ID, params)
         self._channels = BoardShim.get_eeg_channels(config.MUSE_BOARD_ID)
+        self._is_prepared = False
 
     def start(self) -> None:
         self._board.prepare_session()
+        self._is_prepared = True
         self._board.start_stream()
         logger.info("EEG stream started.")
 
     def stop(self) -> None:
-        self._board.stop_stream()
-        self._board.release_session()
-        logger.info("EEG stream stopped.")
+        if self._is_prepared:
+            try:
+                self._board.stop_stream()
+            except Exception as e:
+                logger.debug(f"Error stopping stream: {e}")
+            self._board.release_session()
+            self._is_prepared = False
+            logger.info("EEG stream stopped.")
 
     def readEpoch(self) -> np.ndarray | None:
         """

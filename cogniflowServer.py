@@ -10,24 +10,29 @@ Run:
     Browser:    http://localhost:5000
 """
 
+import sys
 import time
 import threading
 import numpy as np
 from scipy.signal import welch
 from pylsl import StreamInlet, resolve_byprop
 from collections import deque
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, send_from_directory
 from flask_socketio import SocketIO
 import pygame
 import os
+import config
+from arduinoController import ArduinoController
 
-# ── CONFIG ────────────────────────────────────────────────────
+# ── CONFIG (stabilised for smooth dashboard + LED control) ───────
 SAMPLE_RATE      = 256
-BUFFER_SECS      = 2
-CALIBRATION_SECS = 30
-HYSTERESIS       = 3
-BROADCAST_HZ     = 5       # Updates per second to browser
-HISTORY_SECS     = 300     # 5 minute session history
+BUFFER_SECS      = 2          # Welch PSD trailing window (minimized to 2s for fast 4Hz response)
+CALIBUFFER_SECS  = 2     # Welch PSD trailing window (minimized to 2s for fast 4Hz response)
+CALIBRATION_SECS = 15         # 15s baseline — enough data without over-inflating
+HYSTERESIS       = 4          # Epochs to wait before state switch (4 epochs @ 4Hz = 1s lock)
+BROADCAST_HZ     = 4          # Front-end updates per second (4Hz = ultra fast UI)
+HISTORY_SECS     = 300
+EMA_ALPHA        = 0.4        # Exponential moving average (0.4 means 80% change in ~1.5s)
 
 BANDS = {
     "theta": (4.0,  8.0),
@@ -36,17 +41,17 @@ BANDS = {
 }
 
 THRESHOLDS = {
-    "drowsy":  2.2,
-    "stressed": 1.6,
-    "focusAlphaMax": 0.8,
-    "focusBetaMin":  1.1,
+    "fatigue_min":      config.DROWSY_FATIGUE_INDEX,   # (θ+α)/β above this → DROWSY
+    "stress_ratio":     config.STRESSED_BETA_ALPHA,    # β/α above this → STRESSED
+    "focus_engagement": config.FOCUS_BETA_ELEVATE,     # β/(θ+α) above this → FOCUS
+    "focus_alpha_max":  config.FOCUS_ALPHA_SUPPRESS,   # α below this → confirms FOCUS
 }
 
 TRACK_MAP = {
-    "FOCUS":    "focusLofi.mp3",
-    "DROWSY":   "drowsyUpbeat.mp3",
-    "STRESSED": "stressedCalm.mp3",
-    "RELAXED":  None,
+    "FOCUS":    "audios/focus.mp3",
+    "DROWSY":   "audios/drowsy.mp3",
+    "STRESSED": "audios/stressed.mp3",
+    "RELAXED":  "audios/relaxed.mp3",
 }
 
 STATE_DESCRIPTIONS = {
@@ -79,7 +84,7 @@ state = {
 }
 
 
-# ── SIGNAL PROCESSING ─────────────────────────────────────────
+# ── SIGNAL PROCESSING (identical to visualiseBands.py) ────────
 
 def bandPower(eeg: np.ndarray, low: float, high: float) -> float:
     nperseg = min(SAMPLE_RATE, eeg.shape[1])
@@ -87,15 +92,39 @@ def bandPower(eeg: np.ndarray, low: float, high: float) -> float:
     mask = np.logical_and(freqs >= low, freqs <= high)
     return float(np.mean(psd[:, mask]))
 
-def classify(normT: float, normA: float, normB: float) -> str:
-    fatigue = (normT + normA) / (normB + 1e-6)
-    stress  = normB / (normA + 1e-6)
-    if fatigue > THRESHOLDS["drowsy"]:
+def allPowers(eeg: np.ndarray) -> dict:
+    return {b: bandPower(eeg, *BANDS[b]) for b in BANDS}
+
+def classify(norm: dict) -> str:
+    """
+    Classify mental state from normalised band powers using NASA standard formulas.
+
+    Order matters:
+      1. DROWSY  — Fatigue: (θ+α)/β
+      2. FOCUS   — NASA Engagement Index: β / (θ+α)
+      3. STRESSED — Stress Ratio: β/α
+      4. RELAXED  — default
+    """
+    t, a, b = norm["theta"], norm["alpha"], norm["beta"]
+    
+    # Established EEG Indices
+    fatigue    = (t + a) / (b + 1e-6)
+    stress     = b / (a + 1e-6)
+    engagement = b / (t + a + 1e-6)
+
+    # 1. DROWSY (Fatigue > Threshold)
+    if fatigue > THRESHOLDS["fatigue_min"]:
         return "DROWSY"
-    if stress > THRESHOLDS["stressed"]:
-        return "STRESSED"
-    if normA < THRESHOLDS["focusAlphaMax"] and normB > THRESHOLDS["focusBetaMin"]:
+
+    # 2. FOCUS (NASA Engagement > Threshold + Alpha Suppressed)
+    if engagement > THRESHOLDS["focus_engagement"] and a < THRESHOLDS["focus_alpha_max"]:
         return "FOCUS"
+
+    # 3. STRESSED (Stress Ratio > Threshold + Beta elevated)
+    if stress > THRESHOLDS["stress_ratio"] and b > 1.2:
+        return "STRESSED"
+
+    # 4. RELAXED — default calm resting state
     return "RELAXED"
 
 
@@ -121,113 +150,184 @@ def playMusic(stateKey: str) -> None:
 
 # ── EEG THREAD ────────────────────────────────────────────────
 
+def log(msg: str) -> None:
+    """Print with immediate flush so messages appear in terminal."""
+    print(msg, flush=True)
+
+
 def eegThread():
     global state
 
-    print("\n  [ COGNIFLOW ]  Looking for EEG stream...\n")
-    streams = resolve_byprop("type", "EEG", timeout=15)
+    log("\n  [ COGNIFLOW ]  EEG thread started.")
+    log("  Looking for EEG stream (will retry until found)...\n")
 
-    if not streams:
-        print("  ERROR: No EEG stream found. Start muselsl first.")
-        return
+    # ── Retry loop to find the LSL stream ─────────────────────
+    inlet = None
+    while inlet is None:
+        try:
+            streams = resolve_byprop("type", "EEG", timeout=5)
+            if streams:
+                inlet = StreamInlet(streams[0], max_buflen=BUFFER_SECS)
+                state["connected"] = True
+                log(f"  ✓ Connected to EEG stream: {streams[0].name()}")
+                log(f"    Channels: {streams[0].channel_count()}, Rate: {streams[0].nominal_srate()} Hz\n")
+            else:
+                log("  ✗ No EEG stream found — retrying in 3s... (run: muselsl stream)")
+                socketio.emit("eegUpdate", state)
+                time.sleep(3)
+        except Exception as e:
+            log(f"  ✗ Error resolving stream: {e} — retrying in 3s...")
+            time.sleep(3)
 
-    inlet = StreamInlet(streams[0])
-    state["connected"] = True
-    print(f"  Connected: {streams[0].name()}\n")
-    print(f"  Calibrating for {CALIBRATION_SECS}s...\n")
+    # ── Arduino ───────────────────────────────────────────────
+    arduino = None
+    if config.ARDUINO_ENABLED:
+        try:
+            arduino = ArduinoController()
+            arduino.connect()
+            log("  ✓ Arduino connected\n")
+        except Exception as e:
+            log(f"  ✗ Arduino connection failed: {e} — continuing without it\n")
+            arduino = None
 
+    log(f"  Calibrating for {CALIBRATION_SECS}s — sit still, eyes open...\n")
+
+    # ── State (same structure as visualiseBands.py) ───────────
     sampleBuffer  = deque(maxlen=SAMPLE_RATE * BUFFER_SECS)
     calibSamples  = []
     baseline      = None
     calibDone     = False
     calibStart    = time.time()
     hysBuf        = deque(maxlen=HYSTERESIS)
-    prevState     = None
+    currentState  = "CALIBRATING"
     historyBuffer = deque(maxlen=HISTORY_SECS * BROADCAST_HZ)
     lastBroadcast = time.time()
+    history       = deque(maxlen=60)
+    sampleCount   = 0
+
+    # EMA-smoothed band values (initialised after first computation)
+    smoothT = None
+    smoothA = None
+    smoothB = None
 
     while True:
-        sample, _ = inlet.pull_sample(timeout=0.05)
+        try:
+            sample, _ = inlet.pull_sample(timeout=0.05)
 
-        if sample is not None:
-            sampleBuffer.append(sample[:4])
+            if sample is not None:
+                sampleCount += 1
+                sampleBuffer.append(sample[:4])
 
-            # ── Calibration phase ──────────────────────────
-            if not calibDone:
-                calibSamples.append(sample[:4])
-                elapsed   = time.time() - calibStart
-                remaining = max(0, int(CALIBRATION_SECS - elapsed))
-                state["calibSeconds"] = remaining
+                if sampleCount == 1:
+                    log(f"  ✓ First EEG sample received! (values: {[round(v,1) for v in sample[:4]]})")
+                if sampleCount == SAMPLE_RATE:
+                    log(f"  ✓ {SAMPLE_RATE} samples received — stream is healthy")
 
-                if elapsed >= CALIBRATION_SECS and len(calibSamples) >= SAMPLE_RATE:
-                    eegCalib = np.array(calibSamples).T
-                    baseline = {
-                        "theta": bandPower(eegCalib, *BANDS["theta"]),
-                        "alpha": bandPower(eegCalib, *BANDS["alpha"]),
-                        "beta":  bandPower(eegCalib, *BANDS["beta"]),
-                    }
-                    calibDone          = True
-                    state["calibrating"] = False
-                    print(f"  Baseline — θ:{baseline['theta']:.1f}  α:{baseline['alpha']:.1f}  β:{baseline['beta']:.1f}\n")
+                # ── Calibration phase ─────────────────────────────
+                if not calibDone:
+                    calibSamples.append(sample[:4])
+                    elapsed   = time.time() - calibStart
+                    remaining = max(0, int(CALIBRATION_SECS - elapsed))
+                    state["calibSeconds"] = remaining
 
-        # ── Broadcast at BROADCAST_HZ ──────────────────────
-        if time.time() - lastBroadcast < 1.0 / BROADCAST_HZ:
-            continue
+                    if elapsed >= CALIBRATION_SECS and len(calibSamples) >= SAMPLE_RATE:
+                        eegCalib = np.array(calibSamples).T
+                        baseline = allPowers(eegCalib)
+                        calibDone = True
+                        state["calibrating"] = False
+                        log(f"  ✓ Calibration complete!")
+                        log(f"    Baseline — θ:{baseline['theta']:.4f}  α:{baseline['alpha']:.4f}  β:{baseline['beta']:.4f}")
+                        log(f"    Samples collected: {len(calibSamples)}")
+                        log(f"    Now classifying live...\n")
+                        log(f"  {'STATE':<12} {'θ norm':>8} {'α norm':>8} {'β norm':>8}  FATIGUE")
+                        log(f"  {'─'*52}")
 
-        lastBroadcast = time.time()
+            # ── Broadcast at BROADCAST_HZ ─────────────────────
+            now = time.time()
+            if now - lastBroadcast < 1.0 / BROADCAST_HZ:
+                continue
 
-        if not calibDone or len(sampleBuffer) < SAMPLE_RATE * BUFFER_SECS:
+            lastBroadcast = now
+
+            if not calibDone or len(sampleBuffer) < SAMPLE_RATE * BUFFER_SECS:
+                socketio.emit("eegUpdate", state)
+                continue
+
+            # ── Compute powers ────────────────────────────────
+            eeg    = np.array(list(sampleBuffer)).T
+            powers = allPowers(eeg)
+            eps    = 1e-6
+
+            rawT = powers["theta"] / (baseline["theta"] + eps)
+            rawA = powers["alpha"] / (baseline["alpha"] + eps)
+            rawB = powers["beta"]  / (baseline["beta"]  + eps)
+
+            # ── EMA smoothing (gradual transitions) ───────────
+            a = EMA_ALPHA
+            if smoothT is None:
+                smoothT, smoothA, smoothB = rawT, rawA, rawB
+            else:
+                smoothT = a * rawT + (1 - a) * smoothT
+                smoothA = a * rawA + (1 - a) * smoothA
+                smoothB = a * rawB + (1 - a) * smoothB
+
+            normT, normA, normB = smoothT, smoothA, smoothB
+            norm = {"theta": normT, "alpha": normA, "beta": normB}
+
+            fatigue = (normT + normA) / (normB + eps)
+
+            # ── Classify with hysteresis (same as visualiseBands) ─
+            rawState = classify(norm)
+            hysBuf.append(rawState)
+
+            if len(hysBuf) == HYSTERESIS and len(set(hysBuf)) == 1:
+                if currentState != rawState:
+                    currentState = rawState
+                    if calibDone and arduino:
+                        try:
+                            arduino.send(currentState)
+                        except Exception as e:
+                            log(f"  ✗ Arduino send error: {e}")
+
+            history.append(currentState)
+
+            # ── Update shared state ───────────────────────────
+            state["theta"]        = round(normT, 3)
+            state["alpha"]        = round(normA, 3)
+            state["beta"]         = round(normB, 3)
+            state["fatigueIndex"] = round(fatigue, 2)
+            state["currentState"] = currentState
+            state["description"]  = STATE_DESCRIPTIONS[currentState]
+
+            # Session history
+            historyBuffer.append(currentState)
+            state["sessionHistory"] = list(historyBuffer)[-60:]
+
+            # Session stats
+            if currentState in state["sessionStats"]:
+                state["sessionStats"][currentState] += 1
+
+            # Music on state change
+            if currentState != getattr(eegThread, '_prevState', None):
+                playMusic(currentState)
+                eegThread._prevState = currentState
+                engagement_log = normB / (normT + normA + 1e-6)
+                log(f"  {currentState:<12} "
+                    f"θ:{normT:>6.2f}×  "
+                    f"α:{normA:>6.2f}×  "
+                    f"β:{normB:>6.2f}×  "
+                    f"fatg:{(normT+normA)/(normB+1e-6):.2f}  "
+                    f"engg:{engagement_log:.2f}  "
+                    f"str:{normB/(normA+1e-6):.2f}")
+
             socketio.emit("eegUpdate", state)
-            continue
 
-        # ── Compute powers ────────────────────────────────
-        eeg = np.array(list(sampleBuffer)).T
-
-        # Artefact rejection
-        if np.max(np.var(eeg, axis=1)) > 50000:
-            state["artefactsRejected"] += 1
-            socketio.emit("eegUpdate", state)
-            continue
-
-        eps    = 1e-6
-        powers = {b: bandPower(eeg, *BANDS[b]) for b in BANDS}
-        normT  = powers["theta"] / (baseline["theta"] + eps)
-        normA  = powers["alpha"] / (baseline["alpha"] + eps)
-        normB  = powers["beta"]  / (baseline["beta"]  + eps)
-        fatigue = (normT + normA) / (normB + eps)
-
-        # ── Classify with hysteresis ──────────────────────
-        rawState = classify(normT, normA, normB)
-        hysBuf.append(rawState)
-
-        if len(hysBuf) == HYSTERESIS and len(set(hysBuf)) == 1:
-            currentState = rawState
-        else:
-            currentState = prevState or "RELAXED"
-
-        # ── Update shared state ───────────────────────────
-        state["theta"]        = round(normT, 3)
-        state["alpha"]        = round(normA, 3)
-        state["beta"]         = round(normB, 3)
-        state["fatigueIndex"] = round(fatigue, 2)
-        state["currentState"] = currentState
-        state["description"]  = STATE_DESCRIPTIONS[currentState]
-
-        # Session history — one entry per broadcast
-        historyBuffer.append(currentState)
-        state["sessionHistory"] = list(historyBuffer)[-60:]   # last 60 points
-
-        # Session stats
-        if currentState in state["sessionStats"]:
-            state["sessionStats"][currentState] += 1
-
-        # Music
-        if currentState != prevState:
-            playMusic(currentState)
-            prevState = currentState
-            print(f"  {currentState:<10}  θ:{normT:.2f}×  α:{normA:.2f}×  β:{normB:.2f}×  fatigue:{fatigue:.2f}")
-
-        socketio.emit("eegUpdate", state)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            log(f"\n  [ EEG THREAD ERROR ] {e}")
+            log("  Retrying in 1s...\n")
+            time.sleep(1)
 
 
 # ── ROUTES ────────────────────────────────────────────────────
@@ -237,6 +337,9 @@ def index():
     with open(os.path.join(os.path.dirname(__file__), "cogniflowDashboard.html")) as f:
         return f.read()
 
+@app.route("/cogniflowGame.js")
+def game_script():
+    return send_from_directory(os.path.dirname(__file__), "cogniflowGame.js")
 
 @socketio.on("connect")
 def onConnect():
