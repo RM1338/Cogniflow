@@ -131,7 +131,9 @@ class ArduinoController:
             self._serial.write(payload.encode("utf-8"))
             self._serial.flush()
 
-            logger.debug(f"Sent to Arduino: {payload.strip()}")
+            # PROMINENT LOGGING FOR HARDWARE DEBUGGING
+            print(f"  [ ARDUINO ]  Sent: {payload.strip()}")
+            logger.info(f"Sent to Arduino: {payload.strip()}")
 
             # Read ACK (non-blocking with timeout)
             response = self._serial.readline().decode("utf-8", errors="ignore").strip()

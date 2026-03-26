@@ -62,15 +62,32 @@ void setAllLEDs(int r, int g, int b) {
 }
 
 void allOff() {
+  // L298N #1 — Red + Green
   analogWrite(ENA,  0);
   analogWrite(ENB,  0);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  // L298N #2 — Blue + Fan
   analogWrite(ENA2, 0);
+  analogWrite(ENB2, 0);
+  digitalWrite(IN1_2, LOW); digitalWrite(IN2_2, LOW);
+  digitalWrite(IN3_2, LOW); digitalWrite(IN4_2, LOW);
 }
 
 // ── FAN CONTROLS ─────────────────────────────────────────────────────────────
+// ── FAN CONTROLS ─────────────────────────────────────────────────────────────
 void setFan(int speed) {
-  // speed: 0–255
-  analogWrite(ENB2, constrain(speed, 0, 255));
+  int s = constrain(speed, 0, 255);
+  if (s == 0) {
+    // Return to simple stop for comparison
+    analogWrite(ENB2, 0); 
+    digitalWrite(IN3_2, LOW);
+    digitalWrite(IN4_2, LOW);
+  } else {
+    digitalWrite(IN3_2, HIGH);
+    digitalWrite(IN4_2, LOW);
+    analogWrite(ENB2, s);
+  }
 }
 
 // ── SETUP ────────────────────────────────────────────────────────────────────
@@ -93,9 +110,14 @@ void setup() {
   allOff();
   setFan(0);
 
-  // Boot indicator — dim blue
+  // Boot indicator sweep — visually test Red, Green, Blue channels
+  // This proves physical wiring is working before server connects
+  setRed(255);   delay(400); setRed(0);
+  setGreen(255); delay(400); setGreen(0);
+  setBlue(255);  delay(400); setBlue(0);
+  
+  // Settle into dim blue waiting state
   setAllLEDs(0, 30, 60);
-  delay(500);
 
   Serial.println("READY");
 }
@@ -107,6 +129,12 @@ void loop() {
     if (c == '\n') {
       processCommand(inputBuffer);
       inputBuffer = "";
+    } else if (c == 'T') {
+      // Hardware Test Mode: Cycle fan through 0 -> 128 -> 255
+      Serial.println("DIAGNOSTIC: Cycling Fan...");
+      setFan(255); delay(2000);
+      setFan(128); delay(2000);
+      setFan(0);   Serial.println("DIAGNOSTIC: Fan Stopped.");
     } else {
       inputBuffer += c;
     }
@@ -132,12 +160,8 @@ void processCommand(String json) {
   int b             = doc["b"]     | 0;
   int fan           = doc["fan"]   | 0;  // 0–255
 
-  // Apply LEDs
-  if (r == 0 && g == 0 && b == 0) {
-    allOff();
-  } else {
-    setAllLEDs(r, g, b);
-  }
+  // Apply LEDs ...
+  setAllLEDs(r, g, b);
 
   // Apply fan
   setFan(fan);

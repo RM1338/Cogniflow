@@ -69,10 +69,10 @@ TRACK_MAP: dict[str, str | None] = {
 FAN_GPIO_PIN: int = 18   # Must be a hardware PWM pin on RPi
 
 FAN_SPEED: dict[str, float] = {
-    "FOCUS":    0.0,    # Off — no distraction during peak focus
-    "DROWSY":   0.78,   # Strong airflow — cold air elevates cortical arousal
-    "STRESSED": 0.31,   # Gentle breeze — calming without stimulating
-    "RELAXED":  0.0,    # Off — sustain the good state
+    "FOCUS":    0.60,   # Moderate airflow
+    "DROWSY":   0.0,    # Off — as requested
+    "STRESSED": 1.0,    # Full blast cooling
+    "RELAXED":  0.35,   # Gentle air
 }
 
 
@@ -125,10 +125,11 @@ ARDUINO_TIMEOUT:  float = 2.0              # Seconds — serial read timeout
 
 # Fan PWM values (0–255, mapped to analogWrite on Arduino pin 9)
 ARDUINO_FAN_SPEED: dict[str, int] = {
-    "FOCUS":    0,       # Off — no distraction
-    "DROWSY":   255,     # Full blast airflow
-    "STRESSED": 130,     # Low fan
-    "RELAXED":  0,       # Off — sustain the good state
+    "CALIBRATING": 0,       # Initial state - keep fan off
+    "FOCUS":       150,     # Moderate airflow
+    "DROWSY":      0,       # Off — as requested
+    "STRESSED":    255,     # Full blast cooling
+    "RELAXED":     90,      # Gentle air
 }
 
 # NeoPixel LED colours — therapeutic phototherapy palette

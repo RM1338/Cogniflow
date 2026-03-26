@@ -100,10 +100,10 @@ Each cognitive state triggers a unique combination of actuator responses:
 
 | State | LED Colour | Fan Speed | Music | Rationale |
 |:-----:|:----------:|:---------:|:-----:|-----------|
-| 🟢 FOCUS | Purple `(80, 0, 120)` | Off | Lo-fi ambient | Low-arousal lighting sustains deep work |
-| 🟡 DROWSY | Yellow `(255, 180, 0)` | 255 (full) | Upbeat | Cool air + bright light suppress melatonin |
-| 🔴 STRESSED | Teal `(0, 120, 120)` | 130 (low) | Rain / calm | Parasympathetic activation, lowers heart rate |
-| 🔵 RELAXED | Amber `(200, 80, 0)` | Off | Gentle piano | Simulates sunset warmth, sustains alpha |
+| 🟢 FOCUS | Purple `(80, 0, 120)` | 150 (Med) | Lo-fi ambient | Low-arousal lighting sustains deep work |
+| 🟡 DROWSY | Yellow `(255, 180, 0)` | 0 (Off) | Upbeat | Bright light suppresses melatonin |
+| 🔴 STRESSED | Teal `(0, 120, 120)` | 255 (High) | Rain / calm | Parasympathetic activation + cooling lowers heart rate |
+| 🔵 RELAXED | Amber `(200, 80, 0)` | 90 (Low) | Gentle piano | Simulates sunset warmth, sustains alpha |
 
 ---
 
